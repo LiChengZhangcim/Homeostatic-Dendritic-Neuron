@@ -1,0 +1,129 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+from scipy.signal import get_window
+def init_kernels(win_len, win_inc, fft_len, win_type=None, invers=False):
+    if win_type == 'None' or win_type is None:
+        window = np.ones(win_len)
+    else:
+        window = get_window(win_type, win_len, fftbins=True)#**0.5
+    
+    N = fft_len
+    fourier_basis = np.fft.rfft(np.eye(N))[:win_len]
+    real_kernel = np.real(fourier_basis)
+    imag_kernel = np.imag(fourier_basis)
+    kernel = np.concatenate([real_kernel, imag_kernel], 1).T
+    
+    if invers :
+        kernel = np.linalg.pinv(kernel).T 
+
+    kernel = kernel*window
+    kernel = kernel[:, None, :]
+    return torch.from_numpy(kernel.astype(np.float32)), torch.from_numpy(window[None,:,None].astype(np.float32))
+
+
+class ConvSTFT(nn.Module):
+
+    def __init__(self, win_len, win_inc, fft_len=None, win_type='hamming', feature_type='real', fix=True):
+        super(ConvSTFT, self).__init__() 
+        
+        if fft_len == None:
+            self.fft_len = np.int(2**np.ceil(np.log2(win_len))) 
+        else:
+            self.fft_len = fft_len
+        kernel, _ = init_kernels(win_len, win_inc, self.fft_len, win_type)
+        if fix == True:
+            self.register_buffer('weight', kernel)
+        else:
+            self.weight = nn.Parameter(kernel, requires_grad=(True)) 
+            
+        self.feature_type = feature_type
+        self.stride = win_inc
+        self.win_len = win_len
+        self.dim = self.fft_len
+
+    def forward(self, inputs):
+        if inputs.dim() == 2:
+            inputs = torch.unsqueeze(inputs, 1)
+
+        inputs = F.pad(inputs, [self.win_len - self.stride, self.win_len - self.stride], mode='reflect')
+        outputs = F.conv1d(inputs, self.weight, stride=self.stride)
+        dim = self.dim//2+1
+        real = outputs[:, :dim, :]
+        imag = outputs[:, dim:, :]
+        mags = torch.sqrt(real**2+imag**2)
+        phase = torch.atan2(imag, real)
+
+        if self.feature_type == 'complex':
+            return outputs
+        elif self.feature_type == 'mags':
+            return mags
+        elif self.feature_type == 'phase':
+            return phase
+        elif self.feature_type == 'real':
+            return real
+        elif self.feature_type == 'imag':
+            return imag
+
+class ConviSTFT(nn.Module):
+
+    def __init__(self, win_len, win_inc, fft_len=None, win_type='hamming', feature_type='real', fix=True):
+        super(ConviSTFT, self).__init__() 
+        if fft_len == None:
+            self.fft_len = np.int(2**np.ceil(np.log2(win_len)))
+        else:
+            self.fft_len = fft_len
+        kernel, window = init_kernels(win_len, win_inc, self.fft_len, win_type, invers=True)
+        if fix == True:
+            self.register_buffer('weight', kernel)
+        else:
+            self.weight = nn.Parameter(kernel, requires_grad=(True))
+        self.feature_type = feature_type
+        self.stride = win_inc
+        self.win_len = win_len
+        self.dim = self.fft_len
+        self.register_buffer('window', window)
+        self.register_buffer('enframe', torch.eye(win_len)[:,None,:])
+
+    def forward(self, inputs, phase=None):
+
+        if phase is not None:
+            real = inputs*torch.cos(phase)
+            imag = inputs*torch.sin(phase)
+            inputs = torch.cat([real, imag], 1)
+        outputs = F.conv_transpose1d(inputs, self.weight, stride=self.stride) 
+        t = self.window.repeat(1,1,inputs.size(-1))**2
+        coff = F.conv_transpose1d(t, self.enframe, stride=self.stride)
+        outputs = outputs/(coff+1e-8)
+        outputs = outputs[...,self.win_len-self.stride:-(self.win_len-self.stride)] 
+        return outputs
+
+def test_fft():
+    torch.manual_seed(20)
+    win_len = 320
+    win_inc = 160 
+    fft_len = 512
+    inputs = torch.randn([1, 1, 16000*4])
+    fft = ConvSTFT(win_len, win_inc, fft_len, win_type='hanning', feature_type='real')
+    import librosa
+    outputs1 = fft(inputs)[0]
+    outputs1 = outputs1.numpy()[0]
+    np_inputs = inputs.numpy().reshape([-1])
+    librosa_stft = librosa.stft(np_inputs, window='hann',win_length=win_len, n_fft=fft_len, hop_length=win_inc, center=True)
+    print(np.mean((outputs1 - np.abs(librosa_stft))**2))
+
+def test_conv_complex(data):
+    inputs = data.reshape([1, 1, -1])
+    N = 320
+    inc = 160
+    fft_len = 512
+    fft = ConvSTFT(N, inc, fft_len=fft_len, win_type='hamming', feature_type='complex')
+    ifft = ConviSTFT(N, inc, fft_len=fft_len, win_type='hamming', feature_type='complex')
+    inputs = torch.from_numpy(inputs.astype(np.float32))
+    outputs1 = fft(inputs)
+    outputs2 = ifft(outputs1)
+    return outputs2.numpy()[0, 0, :]
+    
+if __name__ == '__main__':
+    test_fft()
